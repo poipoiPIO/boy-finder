@@ -62,17 +62,20 @@ sub handle_inline_query {
     my $query = $inline_query->{query} || '';
     my $query_id = $inline_query->{id};
     
-    return unless $query;
-    
-    say "Inline query: $query";
+    say "Inline query: '$query'";
     
     my @results;
     
     my ($section, $command) = parse_man_query($query);
-    my $man_results = search_man_pages($command, $section);
-    push @results, @$man_results if $man_results;
+    my $exact_results = search_man_pages($command, $section);
+    push @results, @$exact_results if $exact_results;
     
-    @results = @results[0..4] if @results > 5;
+    if ($command && (length($command) <= 2 || !@results)) {
+        my $suggestions = get_man_page_suggestions($command);
+        push @results, @$suggestions if $suggestions;
+    }
+    
+    @results = @results[0..19] if @results > 20;
     
     if (!@results) {
         push @results, {
@@ -111,7 +114,6 @@ sub handle_message {
         $api->sendMessage({
             chat_id => $chat_id,
             text => get_usage_help(),
-            disable_web_page_preview => 0,
             parse_mode => 'HTML'
         });
         return;
@@ -152,9 +154,11 @@ sub search_man_pages {
     my ($command, $section) = @_;
     my @results;
     
-    return [] unless $command =~ /^\w+$/;
+    return [] unless $command && $command =~ /^\w+$/;
     
     my ($description, $first_paragraph) = get_command_description_and_paragraph($command, $section);
+    
+    return [] unless $description;
     
     my $title = $section ? "man $section $command" : "man $command";
     
@@ -289,6 +293,7 @@ sub generate_help_response {
     my $die_net_search = "https://linux.die.net/search/?q=" . uri_escape("$command $actual_section");
     
     my ($description, $first_paragraph) = get_command_description_and_paragraph($command, $actual_section);
+    
     my $response = "<b>$command" . ($actual_section ? "($actual_section)" : "") . "</b>";
     $response .= "\n\n";
     
@@ -333,14 +338,100 @@ sub find_actual_section {
     return $preferred_section || '1';
 }
 
+sub get_man_page_suggestions {
+    my ($command_prefix) = @_;
+    my @results;
+    
+    return [] unless $command_prefix && $command_prefix =~ /^\w+$/;
+    
+    my $cache_key = "suggest_$command_prefix";
+    if (exists $cache{$cache_key}) {
+        return $cache{$cache_key};
+    }
+    
+    say "Getting suggestions for command prefix: '$command_prefix'";
+    
+    my $search_pattern = "^$command_prefix";
+    my $whatis_cmd = "whatis -r '$search_pattern' 2>/dev/null | head -20";
+    my $whatis_output = `$whatis_cmd`;
+    
+    if ($whatis_output && $whatis_output !~ /nothing appropriate/) {
+        my @lines = split /\n/, $whatis_output;
+        
+        foreach my $line (@lines) {
+            next unless $line =~ /^(\w+)\s*\((\d+)\)\s+[-–]\s*(.+)$/;
+            my ($command, $section, $description) = ($1, $2, $3);
+            
+            next if $command eq $command_prefix;
+            
+            $description =~ s/^\s+|\s+$//g;
+            
+            my $short_desc = $description;
+            if (length($short_desc) > 60) {
+                $short_desc = substr($short_desc, 0, 57) . '...';
+            }
+            
+            push @results, {
+                type => 'article',
+                id => "suggest_${section}_$command",
+                title => "man $section $command",
+                input_message_content => {
+                    message_text => generate_help_response($command, $section),
+                    parse_mode => 'HTML'
+                },
+                description => $short_desc
+            };
+        }
+    }
+    
+    if (!@results) {
+        my $man_k_cmd = "man -k '^$command_prefix' 2>/dev/null | head -20";
+        my $man_k_output = `$man_k_cmd`;
+        
+        if ($man_k_output) {
+            my @lines = split /\n/, $man_k_output;
+            
+            foreach my $line (@lines) {
+                next unless $line =~ /^(\w+)\s*\((\d+)\)\s+[-–]\s*(.+)$/;
+                my ($command, $section, $description) = ($1, $2, $3);
+                
+                next if $command eq $command_prefix;
+                
+                $description =~ s/^\s+|\s+$//g;
+                
+                my $short_desc = $description;
+                if (length($short_desc) > 60) {
+                    $short_desc = substr($short_desc, 0, 57) . '...';
+                }
+                
+                push @results, {
+                    type => 'article',
+                    id => "suggest_${section}_$command",
+                    title => "man $section $command",
+                    input_message_content => {
+                        message_text => generate_help_response($command, $section),
+                        parse_mode => 'HTML'
+                    },
+                    description => $short_desc
+                };
+            }
+        }
+    }
+    
+    $cache{$cache_key} = \@results;
+    return \@results;
+}
+
 sub get_usage_help {
     return "<b>Hi there!</b>\n\n" .
            "Search for man pages.\n\n" .
            "<b>Inline Search:</b>\n" .
-           "Type \@$bot_username followed by a command name in any chat\n\n" .
-           "<b>Supported formats:</b>\n" .
-           "ls\n" .
-           "1 malloc\n" .
-           "man 1 malloc\n" .
-           "man 2 open";
+           "Type \@$bot_username followed by:\n" .
+           "• A command name (e.g., <code>ls</code>)\n" .
+           "• A section and command (e.g., <code>2 open</code>)\n" .
+           "<b>Allowed syntax:</b>\n" .
+           "<code>\@$bot_username l</code>\n" .
+           "<code>\@$bot_username ls</code>\n" .
+           "<code>\@$bot_username 1 malloc</code>\n" .
+           "<code>\@$bot_username man 2 open</code>\n\n"
 }
